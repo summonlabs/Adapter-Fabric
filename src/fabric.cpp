@@ -5,6 +5,18 @@
 
 namespace adapter_fabric {
 
+namespace {
+// Locations without a configured limit get the same default as Fabric().
+std::map<ResidencyLocation, std::uint64_t> with_default_limits(std::map<ResidencyLocation, std::uint64_t> limits) {
+  for (auto loc : {ResidencyLocation::device_memory, ResidencyLocation::pinned_host,
+                   ResidencyLocation::pageable_host, ResidencyLocation::process_local,
+                   ResidencyLocation::node_local, ResidencyLocation::persistent_storage}) {
+    limits.emplace(loc, 1ULL << 40);
+  }
+  return limits;
+}
+}  // namespace
+
 Fabric::Fabric() {
   epoch_ = CoordinatorEpoch::none();
   next_adapter_gen_ = AdapterGeneration{1};
@@ -16,7 +28,7 @@ Fabric::Fabric() {
   }
 }
 
-Fabric::Fabric(std::map<ResidencyLocation, std::uint64_t> limits) : capacity_(std::move(limits)) {
+Fabric::Fabric(std::map<ResidencyLocation, std::uint64_t> limits) : capacity_(with_default_limits(std::move(limits))) {
   epoch_ = CoordinatorEpoch::none();
   next_adapter_gen_ = AdapterGeneration{1};
   next_composition_gen_ = CompositionGeneration{1};
@@ -162,6 +174,9 @@ AuthorityCheck Fabric::bind_authority(AdapterId id, const AuthorityFence& fence)
   }
   auto it = authority_.find(id.str());
   if (it == authority_.end()) throw Error(ErrorCode::not_found, "no authority record for adapter");
+  // An invalidated activation is not bound again until the adapter is reloaded.
+  if (it->second.lifecycle.state() == LifecycleState::invalidated)
+    return AuthorityCheck{AuthorityVerdict::stale_residency_generation, "activation invalidated; reload required"};
   it->second.fence = fence;
   it->second.has_authority = true;
   it->second.active = true;
@@ -182,6 +197,26 @@ AuthorityCheck Fabric::reuse_safe(const AuthorityFence& fence) const {
   return AuthorityCheck{AuthorityVerdict::unknown, "reuse denied: not resident/ready"};
 }
 
+bool Fabric::exclusive_conflict(AdapterId id) const { return active_fence_ && active_fence_->adapter != id; }
+
+void Fabric::release_authority(AdapterId id) {
+  auto it = authority_.find(id.str());
+  if (it != authority_.end()) {
+    it->second.active = false;
+    it->second.has_authority = false;
+    it->second.lifecycle.set_state(LifecycleState::ready);
+  }
+  // The ended activation's attempt is over; a new activation brings its own.
+  current_attempt_.erase(id.str());
+  if (active_fence_ && active_fence_->adapter == id) active_fence_.reset();
+}
+
+void Fabric::release_capacity(ResidencyRecord& rec) {
+  if (!rec.capacity_held) return;
+  capacity_.release(ResidencyLocation::device_memory, rec.bytes, rec.instance.str());
+  rec.capacity_held = false;
+}
+
 InvalidationRecord Fabric::invalidate(AdapterId id, InvalidationTrigger trigger, std::string reason) {
   InvalidationRecord rec;
   rec.trigger = trigger;
@@ -198,6 +233,8 @@ InvalidationRecord Fabric::invalidate(AdapterId id, InvalidationTrigger trigger,
     if (it->second.lifecycle.state() != LifecycleState::invalidated)
       it->second.lifecycle.set_state(LifecycleState::invalidated);
   }
+  // The invalidated activation's attempt is over; the activation after a reload brings its own.
+  current_attempt_.erase(id.str());
   if (active_fence_ && active_fence_->adapter == id) active_fence_.reset();
   return rec;
 }
@@ -207,6 +244,9 @@ bool Fabric::evict(AdapterInstanceId inst, std::string& reason) {
   if (it == residencies_.end()) { reason = "no such instance"; return false; }
   if (it->second.active_refs > 0) { reason = "active references"; return false; }
   if (it->second.pin_count > 0 || it->second.protected_) { reason = "protected or pinned"; return false; }
+  // The instance that holds execution authority is not evicted.
+  auto ar = authority_.find(it->second.adapter_id.str());
+  if (ar != authority_.end() && ar->second.has_authority && ar->second.instance == inst) { reason = "active"; return false; }
   residencies_.erase(it);
   reason = "evicted";
   return true;
@@ -238,7 +278,8 @@ FabricSnapshot Fabric::snapshot() const {
 }
 
 void Fabric::recover(const FabricSnapshot& s) {
-  epoch_ = s.epoch;
+  // The recovered coordinator is a new authority: fences issued before the restart are stale.
+  epoch_ = s.epoch.next();
   next_adapter_gen_ = s.next_adapter_generation;
   next_composition_gen_ = s.next_composition_generation;
   adapters_.clear();
@@ -246,7 +287,12 @@ void Fabric::recover(const FabricSnapshot& s) {
   compositions_.clear();
   for (const auto& c : s.compositions) compositions_[c.id.str()] = c;
   workers_.clear();
-  for (const auto& w : s.workers) workers_[w.id.str()] = w;
+  // A recovered worker is not connected until it registers again.
+  for (const auto& w : s.workers) {
+    WorkerRecord rec = w;
+    rec.connected = false;
+    workers_[w.id.str()] = rec;
+  }
 }
 
 void Fabric::on_worker_down(WorkerId id) {
@@ -259,7 +305,7 @@ void Fabric::on_worker_down(WorkerId id) {
     }
   }
   for (auto& kv : residencies_) {
-    if (kv.second.worker == id) { kv.second.ready = false; }
+    if (kv.second.worker == id) { kv.second.ready = false; release_capacity(kv.second); }
   }
   auto it = workers_.find(id.str());
   if (it != workers_.end()) it->second.connected = false;
@@ -279,6 +325,7 @@ void Fabric::on_worker_restart(WorkerId id, WorkerBootId new_boot) {
     if (kv.second.worker == id && kv.second.boot != new_boot) {
       kv.second.ready = false;
       kv.second.migration = MigrationState::none;
+      release_capacity(kv.second);
     }
   }
   if (active_fence_ && active_fence_->worker == id && active_fence_->boot != new_boot) active_fence_.reset();

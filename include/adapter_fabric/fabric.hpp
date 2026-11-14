@@ -80,6 +80,15 @@ class Fabric {
   // Is reuse of an existing instance safe given a candidate fence?
   AuthorityCheck reuse_safe(const AuthorityFence& fence) const;
 
+  // True when another adapter holds exclusive execution authority.
+  bool exclusive_conflict(AdapterId adapter) const;
+
+  // End an adapter's activation: it no longer holds execution authority.
+  void release_authority(AdapterId adapter);
+
+  // Return the device capacity reserved for an instance, if it still holds it.
+  void release_capacity(ResidencyRecord& rec);
+
   // --- worker restart ---
   // Invalidate all authority/residency held by a worker under a prior boot.
   void on_worker_restart(WorkerId id, WorkerBootId new_boot);

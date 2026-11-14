@@ -29,6 +29,8 @@ class TcpSocket {
   bool send_frame(const std::vector<std::uint8_t>& payload);
   bool recv_frame(std::vector<std::uint8_t>& payload);
   void close() noexcept;
+  // Wakes a thread blocked in recv on this socket; later I/O on it fails.
+  void interrupt() noexcept;
   bool valid() const noexcept;
   std::string peer_address() const;
 

@@ -14,6 +14,7 @@ set(AF_TESTS
   test_adversarial
   test_concurrency
   test_cuda
+  test_regression
 )
 foreach(t ${AF_TESTS})
   add_executable(${t} ${t}.cpp)
@@ -32,4 +33,13 @@ if(TARGET af_coordinator AND TARGET af_worker)
   target_compile_definitions(test_multiprocess PRIVATE
     AF_COORDINATOR_EXE="$<TARGET_FILE:af_coordinator>"
     AF_WORKER_EXE="$<TARGET_FILE:af_worker>")
+
+  # Coordinator regression checks against the real af_coordinator process, with
+  # fake workers and control clients (this test only connects; it never listens).
+  add_executable(test_multiprocess_regression test_multiprocess_regression.cpp)
+  target_link_libraries(test_multiprocess_regression PRIVATE adapter_fabric)
+  af_enable_strict_warnings(test_multiprocess_regression)
+  add_test(NAME test_multiprocess_regression COMMAND test_multiprocess_regression)
+  target_compile_definitions(test_multiprocess_regression PRIVATE
+    AF_COORDINATOR_EXE="$<TARGET_FILE:af_coordinator>")
 endif()

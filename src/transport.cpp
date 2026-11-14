@@ -6,6 +6,7 @@
 #include "adapter_fabric/error.hpp"
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 #include <cstring>
 #include <cstddef>
 
@@ -131,6 +132,13 @@ bool TcpSocket::recv_frame(std::vector<std::uint8_t>& payload) {
 
 void TcpSocket::close() noexcept {
   if (socket_ != nullptr) { closesocket(raw(socket_)); socket_ = nullptr; }
+}
+
+void TcpSocket::interrupt() noexcept {
+  if (socket_ == nullptr) return;
+  ::shutdown(raw(socket_), SD_BOTH);
+  // shutdown() alone does not wake a recv already blocked on the socket.
+  ::CancelIoEx(reinterpret_cast<HANDLE>(raw(socket_)), nullptr);
 }
 
 std::string TcpSocket::peer_address() const {

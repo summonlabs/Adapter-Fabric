@@ -51,6 +51,7 @@ struct ResidencyRecord {
   CoordinatorEpoch epoch;
   DeviceId device;
   bool ready = false;
+  bool capacity_held = false;   // device capacity for `bytes` is reserved for this instance
   std::uint32_t active_refs = 0;
   std::uint32_t pin_count = 0;
   bool protected_ = false;

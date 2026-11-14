@@ -39,6 +39,12 @@ void CoordinatorServer::stop() {
   running_ = false;
   accept_listener_.close();
   if (accept_thread_.joinable()) { try { accept_thread_.join(); } catch (...) {} }
+  // Connection threads block in recv: wake every open connection so they can be joined.
+  {
+    std::lock_guard<std::mutex> lk(connections_mc_);
+    for (auto& w : connections_) if (auto s = w.lock()) s->interrupt();
+    connections_.clear();
+  }
   for (auto& th : conn_threads_) if (th.joinable()) { try { th.join(); } catch (...) {} }
   conn_threads_.clear();
 }
@@ -48,6 +54,11 @@ void CoordinatorServer::accept_loop() {
     TcpSocket conn = accept_listener_.accept();
     if (!conn.valid()) break;
     auto sp = std::make_shared<TcpSocket>(std::move(conn));
+    {
+      std::lock_guard<std::mutex> lk(connections_mc_);
+      std::erase_if(connections_, [](const std::weak_ptr<TcpSocket>& w) { return w.expired(); });
+      connections_.push_back(sp);
+    }
     conn_threads_.emplace_back(&CoordinatorServer::handle_connection, this, sp);
   }
 }
@@ -58,23 +69,48 @@ void CoordinatorServer::handle_connection(std::shared_ptr<TcpSocket> conn) {
   std::shared_ptr<WorkerSlot> slot;
   while (!shutdown_ && conn->recv_frame(buf)) {
     Message msg;
-    try { msg = decode_message(buf); } catch (...) { return; }
+    // A frame that does not decode ends the connection, and with it a worker's registration.
+    try { msg = decode_message(buf); } catch (...) { break; }
     if (msg.type == MsgType::wk_register) {
-      slot = std::make_shared<WorkerSlot>();
-      slot->sock = conn;
-      slot->id = must_parse<WorkerId>(msg.text);
-      slot->boot = must_parse<WorkerBootId>(msg.text2);
-      slot->address = msg.text3;
-      slot->connected = true;
-      { std::lock_guard<std::mutex> lk(workers_mc_); workers_[msg.text] = slot; }
-      { std::lock_guard<std::mutex> lk(state_mc_);
-        WorkerRecord rec; rec.id = slot->id; rec.boot = slot->boot; rec.address = slot->address;
-        rec.connected = true; rec.epoch = fabric_.epoch(); if (!msg.text4.empty()) rec.node = must_parse<NodeId>(msg.text4);
-        fabric_.register_worker(rec);
-        fabric_.on_worker_restart(slot->id, slot->boot);
+      auto fresh = std::make_shared<WorkerSlot>();
+      fresh->sock = conn;
+      NodeId node;
+      // A malformed registration is refused; it must not take the coordinator down.
+      try {
+        fresh->id = must_parse<WorkerId>(msg.text);
+        fresh->boot = must_parse<WorkerBootId>(msg.text2);
+        if (!msg.text4.empty()) node = must_parse<NodeId>(msg.text4);
+      } catch (const Error&) { break; }
+      fresh->address = msg.text3;
+      fresh->connected = true;
+      bool accepted = false;
+      std::uint64_t epoch = 0;
+      {
+        // Registration and loss handling are serialized. A boot that was lost
+        // or superseded never registers again: replaying it is stale.
+        std::lock_guard<std::mutex> lk(workers_mc_);
+        if (retired_boots_.count(fresh->id.str() + "/" + fresh->boot.str()) == 0) {
+          accepted = true;
+          auto prev = workers_.find(fresh->id.str());
+          if (prev != workers_.end() && prev->second->boot != fresh->boot)
+            retired_boots_.insert(prev->second->id.str() + "/" + prev->second->boot.str());
+          workers_[fresh->id.str()] = fresh;
+          std::lock_guard<std::mutex> sk(state_mc_);
+          WorkerRecord rec; rec.id = fresh->id; rec.boot = fresh->boot; rec.address = fresh->address;
+          rec.connected = true; rec.epoch = fabric_.epoch(); rec.node = node;
+          fabric_.register_worker(rec);
+          fabric_.on_worker_restart(fresh->id, fresh->boot);
+          epoch = fabric_.epoch().value();
+        }
       }
-      Message ack; ack.type = MsgType::wk_register_ack; ack.ok = true; ack.a = fabric_.epoch().value();
-      ack.text = std::to_string(fabric_.epoch().value());
+      if (!accepted) {
+        Message nack; nack.type = MsgType::wk_register_ack; nack.ok = false; nack.text = "stale worker boot";
+        conn->send_frame(encode_message(nack));
+        break;
+      }
+      slot = fresh;
+      Message ack; ack.type = MsgType::wk_register_ack; ack.ok = true; ack.a = epoch;
+      ack.text = std::to_string(epoch);
       conn->send_frame(encode_message(ack));
       is_worker = true;
       continue;
@@ -83,7 +119,8 @@ void CoordinatorServer::handle_connection(std::shared_ptr<TcpSocket> conn) {
       if (msg.req_id != 0) {
         std::shared_ptr<Pending> pend;
         { std::lock_guard<std::mutex> lk(pending_mc_); auto it = pending_.find(msg.req_id); if (it != pending_.end()) pend = it->second; }
-        if (pend) { std::lock_guard<std::mutex> lk(pend->m); pend->result = msg; pend->done = true; pend->cv.notify_one(); }
+        // Only the connection the request was sent to can answer it.
+        if (pend && pend->slot == slot) { std::lock_guard<std::mutex> lk(pend->m); pend->result = msg; pend->done = true; pend->cv.notify_one(); }
       }
       continue;
     }
@@ -91,17 +128,26 @@ void CoordinatorServer::handle_connection(std::shared_ptr<TcpSocket> conn) {
     if (!conn->send_frame(encode_message(out))) return;
   }
   if (slot) {
-    { std::lock_guard<std::mutex> lk(workers_mc_); slot->connected = false; }
-    abort_pending_for_worker(slot->id.str());
-    { std::lock_guard<std::mutex> lk(state_mc_); fabric_.on_worker_down(slot->id); }
+    {
+      std::lock_guard<std::mutex> lk(workers_mc_);
+      slot->connected = false;
+      // Only the registered connection's loss takes the worker down; the close
+      // of a connection that a newer registration replaced leaves it alone.
+      auto it = workers_.find(slot->id.str());
+      if (it != workers_.end() && it->second == slot) {
+        retired_boots_.insert(slot->id.str() + "/" + slot->boot.str());
+        std::lock_guard<std::mutex> sk(state_mc_);
+        fabric_.on_worker_down(slot->id);
+      }
+    }
+    abort_pending_for_worker(slot);
   }
 }
 
-void CoordinatorServer::abort_pending_for_worker(const std::string& worker_id) {
-  (void)worker_id;
+void CoordinatorServer::abort_pending_for_worker(const std::shared_ptr<WorkerSlot>& slot) {
   std::vector<std::shared_ptr<Pending>> failed;
   { std::lock_guard<std::mutex> lk(pending_mc_);
-    for (auto& kv : pending_) { auto& pd = kv.second; std::lock_guard<std::mutex> pk(pd->m); if (!pd->done) { pd->done = true; pd->result.type = MsgType::wk_error; pd->result.ok = false; pd->result.text = "worker disconnected"; failed.push_back(pd); } }
+    for (auto& kv : pending_) { auto& pd = kv.second; if (pd->slot != slot) continue; std::lock_guard<std::mutex> pk(pd->m); if (!pd->done) { pd->done = true; pd->result.type = MsgType::wk_error; pd->result.ok = false; pd->result.text = "worker disconnected"; failed.push_back(pd); } }
   }
   for (auto& pd : failed) pd->cv.notify_all();
 }
@@ -112,6 +158,7 @@ Message CoordinatorServer::forward_to_worker(std::uint64_t req_id, const std::st
   Message fail; fail.type = MsgType::wk_error; fail.ok = false; fail.text = "unknown or disconnected worker";
   if (!slot || !slot->connected || !slot->sock) return fail;
   auto pend = std::make_shared<Pending>();
+  pend->slot = slot;
   { std::lock_guard<std::mutex> lk(pending_mc_); pending_[req_id] = pend; }
   Message f = fwd; f.req_id = req_id;
   if (!slot->sock->send_frame(encode_message(f))) {
@@ -155,15 +202,31 @@ Message CoordinatorServer::process_control(const Message& req) {
       }
       case MsgType::ctl_load: {
         AuthorityFence fence = decode_fence(req.payload);
-        { std::lock_guard<std::mutex> lk(state_mc_); auto pre = fabric_.check_fence(fence); if (!pre.authorized()) { out.ok = false; out.text = pre.reason; return out; } }
         std::string worker_id = req.text2;
-        std::uint64_t bytes = 0;
         AdapterInstanceId inst;
-        { std::lock_guard<std::mutex> lk(state_mc_); const AdapterDescriptor* ad = fabric_.adapter(fence.adapter); if (ad) bytes = ad->memory_bytes; inst = fabric_.create_instance(fence.adapter, fence.worker, fence.boot, fence.device, bytes); }
+        {
+          std::lock_guard<std::mutex> lk(state_mc_);
+          auto pre = fabric_.check_fence(fence);
+          if (!pre.authorized()) { out.ok = false; out.text = pre.reason; return out; }
+          const AdapterDescriptor* ad = fabric_.adapter(fence.adapter);
+          const std::uint64_t bytes = ad ? ad->memory_bytes : 0;
+          // Capacity is reserved before anything is loaded: a load that does not
+          // fit fails with nothing created and nothing sent to the worker.
+          if (bytes > fabric_.capacity().free(ResidencyLocation::device_memory)) {
+            out.ok = false; out.text = "capacity: device memory exhausted"; return out;
+          }
+          inst = fabric_.create_instance(fence.adapter, fence.worker, fence.boot, fence.device, bytes);
+          fabric_.capacity().reserve(ResidencyLocation::device_memory, bytes, inst.str());
+          fabric_.residency(inst)->capacity_held = true;
+        }
         Message fwd; fwd.type = MsgType::wk_load; fwd.text = fence.adapter.str(); fwd.text2 = inst.str(); fwd.payload = encode_fence(fence);
         Message ack = forward_to_worker(next_req_++, worker_id, fwd);
-        if (ack.ok) {
-          { std::lock_guard<std::mutex> lk(state_mc_); auto* rec = fabric_.residency(inst); if (rec) { rec->ready = true; rec->bytes = ack.a; } try { fabric_.capacity().reserve(ResidencyLocation::device_memory, ack.a, inst.str()); } catch (...) {} }
+        {
+          std::lock_guard<std::mutex> lk(state_mc_);
+          if (auto* rec = fabric_.residency(inst)) {
+            if (ack.ok) rec->ready = true;
+            else fabric_.release_capacity(*rec);  // the load failed: its reservation is returned
+          }
         }
         out.ok = ack.ok; out.text = ack.ok ? "loaded" : ack.text; out.text2 = inst.str();
         if (out.ok) { std::lock_guard<std::mutex> lk(state_mc_); auto* ar = const_cast<AdapterAuthorityRecord*>(fabric_.authority_record(fence.adapter)); if (ar) ar->lifecycle.set_state(LifecycleState::ready); }
@@ -171,7 +234,16 @@ Message CoordinatorServer::process_control(const Message& req) {
       }
       case MsgType::ctl_activate: {
         AuthorityFence fence = decode_fence(req.payload);
-        { std::lock_guard<std::mutex> lk(state_mc_); auto pre = fabric_.check_fence(fence); if (!pre.authorized()) { out.ok = false; out.text = pre.reason; return out; } }
+        // One activation at a time, and exclusivity is checked before the worker is told to activate.
+        std::lock_guard<std::mutex> act(activation_mc_);
+        {
+          std::lock_guard<std::mutex> lk(state_mc_);
+          auto pre = fabric_.check_fence(fence);
+          if (!pre.authorized()) { out.ok = false; out.text = pre.reason; return out; }
+          if (fabric_.exclusive_conflict(fence.adapter)) {
+            out.ok = false; out.text = "authority_conflict: another adapter holds exclusive execution authority"; return out;
+          }
+        }
         std::string worker_id = req.text2;
         Message fwd; fwd.type = MsgType::wk_activate; fwd.text = fence.adapter.str(); fwd.payload = encode_fence(fence);
         Message ack = forward_to_worker(next_req_++, worker_id, fwd);
@@ -185,12 +257,14 @@ Message CoordinatorServer::process_control(const Message& req) {
         AdapterId id = must_parse<AdapterId>(req.text);
         Message fwd; fwd.type = MsgType::wk_deactivate; fwd.text = id.str();
         Message ack = forward_to_worker(next_req_++, req.text2, fwd);
-        { std::lock_guard<std::mutex> lk(state_mc_); auto* ar = const_cast<AdapterAuthorityRecord*>(fabric_.authority_record(id)); if (ar) ar->lifecycle.set_state(LifecycleState::ready); }
+        // A completed deactivation ends the activation's execution authority.
+        if (ack.ok) { std::lock_guard<std::mutex> lk(state_mc_); fabric_.release_authority(id); }
         out.ok = ack.ok; out.text = ack.ok ? "deactivated" : ack.text;
         return out;
       }
       case MsgType::ctl_migrate: {
         AuthorityFence fence = decode_fence(req.payload);
+        { std::lock_guard<std::mutex> lk(state_mc_); auto pre = fabric_.check_fence(fence); if (!pre.authorized()) { out.ok = false; out.text = pre.reason; return out; } }
         Message fwd; fwd.type = MsgType::wk_migrate; fwd.text = fence.adapter.str(); fwd.text2 = req.text2; fwd.payload = encode_fence(fence);
         Message ack = forward_to_worker(next_req_++, req.text2, fwd);
         out.ok = ack.ok; out.text = ack.ok ? "migrated" : ack.text;
@@ -207,8 +281,8 @@ Message CoordinatorServer::process_control(const Message& req) {
       }
       case MsgType::ctl_evict: {
         AdapterInstanceId inst = must_parse<AdapterInstanceId>(req.text);
-        std::string reason; bool ok; std::uint64_t bytes = 0;
-        { std::lock_guard<std::mutex> lk(state_mc_); if (auto* rec = fabric_.residency(inst)) bytes = rec->bytes; ok = fabric_.evict(inst, reason); if (ok) { try { fabric_.capacity().release(ResidencyLocation::device_memory, bytes, inst.str()); } catch (...) {} } }
+        std::string reason; bool ok; std::uint64_t bytes = 0; bool held = false;
+        { std::lock_guard<std::mutex> lk(state_mc_); if (auto* rec = fabric_.residency(inst)) { bytes = rec->bytes; held = rec->capacity_held; } ok = fabric_.evict(inst, reason); if (ok && held) { try { fabric_.capacity().release(ResidencyLocation::device_memory, bytes, inst.str()); } catch (...) {} } }
         Message fwd; fwd.type = MsgType::wk_deactivate; fwd.text = inst.str();
         forward_to_worker(next_req_++, req.text2, fwd);
         out.ok = ok; out.text = reason;

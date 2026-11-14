@@ -30,7 +30,21 @@ namespace adapter_fabric {
 
 namespace {
 
-struct ChildProcess { void* handle = nullptr; std::uint32_t pid = 0; };
+struct ChildProcess;
+void terminate(ChildProcess& c);
+
+// A child process that is terminated, and waited for, when it goes out of scope,
+// so every return path of a proof leaves no process (or listening port) behind.
+struct ChildProcess {
+  void* handle = nullptr;
+  std::uint32_t pid = 0;
+  ChildProcess() = default;
+  ChildProcess(const ChildProcess&) = delete;
+  ChildProcess& operator=(const ChildProcess&) = delete;
+  ChildProcess(ChildProcess&& o) noexcept : handle(o.handle), pid(o.pid) { o.handle = nullptr; }
+  ChildProcess& operator=(ChildProcess&&) = delete;
+  ~ChildProcess() { terminate(*this); }
+};
 
 ChildProcess spawn(const std::string& cmd) {
   ChildProcess c;
@@ -46,7 +60,14 @@ ChildProcess spawn(const std::string& cmd) {
 
 void terminate(ChildProcess& c) {
 #ifdef _WIN32
-  if (c.handle) { TerminateProcess(static_cast<HANDLE>(c.handle), 0); CloseHandle(static_cast<HANDLE>(c.handle)); c.handle = nullptr; }
+  if (c.handle) {
+    TerminateProcess(static_cast<HANDLE>(c.handle), 0);
+    // Until it has exited, a killed coordinator still listens on the proof's
+    // port, and a following run could reach it instead of its own coordinator.
+    WaitForSingleObject(static_cast<HANDLE>(c.handle), INFINITE);
+    CloseHandle(static_cast<HANDLE>(c.handle));
+    c.handle = nullptr;
+  }
 #endif
 }
 

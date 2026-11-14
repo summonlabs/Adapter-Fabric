@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -39,7 +40,6 @@ class CoordinatorServer {
   void accept_loop();
   void handle_connection(std::shared_ptr<TcpSocket> conn);
   Message forward_to_worker(std::uint64_t req_id, const std::string& worker_id, const Message& fwd);
-  void abort_pending_for_worker(const std::string& worker_id);
 
   struct WorkerSlot {
     std::shared_ptr<TcpSocket> sock;
@@ -54,7 +54,10 @@ class CoordinatorServer {
     std::condition_variable cv;
     bool done = false;
     Message result;
+    std::shared_ptr<WorkerSlot> slot;  // the worker connection the request was sent to
   };
+
+  void abort_pending_for_worker(const std::shared_ptr<WorkerSlot>& slot);
 
   std::uint16_t port_;
   std::atomic<bool> running_{false};
@@ -63,7 +66,11 @@ class CoordinatorServer {
 
   Fabric fabric_;
   std::map<std::string, std::shared_ptr<WorkerSlot>> workers_;
+  std::set<std::string> retired_boots_;   // "<worker>/<boot>" lost or superseded; guarded by workers_mc_
   std::mutex workers_mc_;
+  std::vector<std::weak_ptr<TcpSocket>> connections_;  // open connections, woken by stop()
+  std::mutex connections_mc_;
+  std::mutex activation_mc_;         // one activation at a time: check, worker activation, bind
   std::mutex state_mc_;              // guards state mutation; no net I/O under it
   std::atomic<std::uint64_t> next_req_{1};
   std::map<std::uint64_t, std::shared_ptr<Pending>> pending_;
